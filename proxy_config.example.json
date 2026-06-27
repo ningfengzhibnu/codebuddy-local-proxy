@@ -1,0 +1,20 @@
+{
+  "accounts": [
+    {
+      "name": "示例账号1",
+      "api_key": "sk-your-api-key-here",
+      "ck_key": "ck_your_ck_key_from_browser_cookies",
+      "enabled": true,
+      "models": ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.6", "glm-5.2"],
+      "default_model": "deepseek-v4-pro"
+    },
+    {
+      "name": "示例账号2",
+      "api_key": "sk-another-key",
+      "ck_key": "ck_another_ck_key",
+      "enabled": false,
+      "models": ["deepseek-v4-pro", "glm-5.2"],
+      "default_model": "deepseek-v4-pro"
+    }
+  ]
+}
