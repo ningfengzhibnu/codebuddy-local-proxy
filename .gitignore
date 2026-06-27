@@ -1,0 +1,21 @@
+# 配置文件（含真实密钥，不要提交）
+proxy_config.json
+checkin_config.json
+
+# 代理启动日志
+proxy.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+env/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
