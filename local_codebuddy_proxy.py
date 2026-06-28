@@ -2,44 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 CodeBuddy CN 纯 LLM API 代理 + Web 管理后台
-
-功能：
-1. 将 WorkBuddy 的 API 请求转发到 CodeBuddy CN (copilot.tencent.com)
-2. 提供 Web 管理后台 (http://127.0.0.1:19090/admin/dashboard)：
-   - 多账号管理（增删改/启停）
-   - 模型选择（按账号勾选模型）
-   - 一键同步模型配置到 WorkBuddy
-   - 使用统计
-
-原理：
-  WorkBuddy(Windows) → 本代理(localhost:19090) → copilot.tencent.com/v2/chat/completions
-  CN API 仅支持流式，非流式请求由本代理聚合 SSE 后返回。
-  Agent Loop 在 Windows 本地执行，无需远程 Linux 服务器。
-
-依赖：Python 3.8+ (纯标准库，无第三方依赖)
-
-快速开始：
-  1. 修改本文件中的 DEFAULT_ACCOUNTS，填入你的 CK Key
-  2. 运行: python local_codebuddy_proxy.py
-  3. 打开管理后台: http://127.0.0.1:19090/admin/dashboard
-  4. 在 WorkBuddy models.json 中配置指向 http://127.0.0.1:19090
+- LLM 代理: WorkBuddy -> 本代理(Windows) -> copilot.tencent.com/v2/chat/completions
+- 管理后台: http://127.0.0.1:19090/admin/dashboard
+- Agent Loop 在 Windows 本地执行
 """
-
-import json
-import os
-import sys
-import time
-import uuid
-import ssl
-import threading
-import copy
-import shutil
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+import json, os, sys, time, uuid, ssl, threading, copy, re, shutil, traceback, socket
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.client import IncompleteRead
+from urllib.parse import urlparse, parse_qs, unquote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-
-# ======================== 配置 ========================
 
 HOST = "127.0.0.1"
 PORT = 19090
@@ -48,23 +20,49 @@ CN_API = "https://copilot.tencent.com/v2/chat/completions"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "proxy_config.json")
 ADMIN_HTML_FILE = os.path.join(SCRIPT_DIR, "admin_dashboard.html")
+STATS_FILE = os.path.join(SCRIPT_DIR, "proxy_stats.json")
+LOG_FILE = os.path.join(SCRIPT_DIR, "proxy.log")
 WB_MODELS_FILE = os.path.expandvars(r"%USERPROFILE%\.workbuddy\models.json")
 CB_MODELS_FILE = os.path.expandvars(r"%USERPROFILE%\.codebuddy\models.json")
 
-# ======================== 默认账号（请替换为你的真实 CK Key） ========================
+def log(msg):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as lf:
+            lf.write(line + "\n")
+    except:
+        pass
+
+# ======================== 配置管理 ========================
 
 DEFAULT_ACCOUNTS = [
     {
-        "name": "我的账号",
-        "api_key": "sk-my-account-key",
-        "ck_key": "ck_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "name": "账号1",
+        "api_key": "sk-account-1",
+        "ck_key": "ck_YOUR_CK_KEY_HERE",
+        "enabled": True,
+        "models": ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.6", "kimi-k2.7", "glm-5.2", "glm-5.1"],
+        "default_model": "deepseek-v4-pro",
+    },
+    {
+        "name": "账号2",
+        "api_key": "sk-account-2",
+        "ck_key": "ck_YOUR_CK_KEY_HERE",
+        "enabled": True,
+        "models": ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.6", "kimi-k2.7", "glm-5.2", "glm-5.1"],
+        "default_model": "deepseek-v4-pro",
+    },
+    {
+        "name": "账号3",
+        "api_key": "sk-account-3",
+        "ck_key": "ck_YOUR_CK_KEY_HERE",
         "enabled": True,
         "models": ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.6", "kimi-k2.7", "glm-5.2", "glm-5.1"],
         "default_model": "deepseek-v4-pro",
     },
 ]
 
-# 已知可用模型列表（可通过管理后台为账号选择）
 KNOWN_MODELS = [
     "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-thinking",
     "deepseek-v3-2-volc", "deepseek-v3-2", "deepseek-v3", "deepseek-r1",
@@ -76,50 +74,62 @@ KNOWN_MODELS = [
     "gpt-5.5", "gpt-5.6", "gpt-5.7",
 ]
 
-# ======================== 配置管理 ========================
-
-
 def load_config():
-    """加载持久化配置，不存在则使用默认配置"""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             return cfg
-        except Exception:
+        except:
             pass
     return {"accounts": copy.deepcopy(DEFAULT_ACCOUNTS)}
 
-
 def save_config(cfg):
-    """保存配置到文件"""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
+    tmp = CONFIG_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, CONFIG_FILE)  # 原子写入
+    except Exception as e:
+        log(f"[config] 保存失败: {e}")
 
 config = load_config()
 config_lock = threading.Lock()
 
-# ======================== 使用统计 ========================
+# ======================== 统计 (持久化) ========================
 
-stats = {}
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_stats_file(s):
+    try:
+        with open(STATS_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2, ensure_ascii=False)
+        os.replace(STATS_FILE + ".tmp", STATS_FILE)
+    except Exception as e:
+        log(f"[stats] 保存失败: {e}")
+
+stats = load_stats()
 stats_lock = threading.Lock()
 
+_last_stats_save = 0
 
 def record_stats(api_key, input_tokens, output_tokens, ok, err=""):
-    """记录 API 调用统计"""
+    global _last_stats_save
+    need_save = False
     with stats_lock:
         if api_key not in stats:
             stats[api_key] = {
-                "call_count": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "success_count": 0,
-                "error_count": 0,
-                "last_used": None,
-                "last_error": "",
+                "call_count": 0, "input_tokens": 0, "output_tokens": 0,
+                "total_tokens": 0, "success_count": 0, "error_count": 0,
+                "last_used": None, "last_error": "",
             }
         s = stats[api_key]
         s["call_count"] += 1
@@ -132,13 +142,17 @@ def record_stats(api_key, input_tokens, output_tokens, ok, err=""):
         else:
             s["error_count"] += 1
             s["last_error"] = str(err)[:200]
+        now = time.time()
+        if now - _last_stats_save > 1:  # 至少间隔1秒防抖动
+            need_save = True
+            _last_stats_save = now
+    # 在锁外保存，避免文件 I/O 阻塞其他线程
+    if need_save:
+        save_stats_file(stats)
 
+# ======================== LLM 代理 ========================
 
-# ======================== LLM 代理核心 ========================
-
-
-def do_llm_call(ck_key, body_bytes):
-    """发送请求到 CodeBuddy CN API"""
+def do_llm_call(ck_key, body_bytes, stream):
     headers = {
         "Content-Type": "application/json",
         "Authorization": "Bearer " + ck_key,
@@ -150,62 +164,58 @@ def do_llm_call(ck_key, body_bytes):
     try:
         ctx = ssl.create_default_context()
         resp = urlopen(req, timeout=180, context=ctx)
-        return resp
+        if stream:
+            return "stream", resp
+        else:
+            return "sync", resp.read().decode("utf-8")
     except HTTPError as e:
         err_body = e.read().decode(errors="replace")
         raise RuntimeError(f"HTTP {e.code}: {err_body[:500]}")
     except URLError as e:
         raise RuntimeError(f"连接失败: {e.reason}")
 
-
 # ======================== SSE 聚合 ========================
 
-
 def sse_to_nonstream(sse_text):
-    """将 SSE 流式响应聚合为 OpenAI 格式 JSON"""
     content, reasoning = "", ""
     tool_calls = []
     finish = "stop"
     model = ""
     pt, ct = 0, 0
 
-    for line in sse_text.split("\n"):
-        if not line.startswith("data: "):
+    for line in sse_text.split('\n'):
+        if not line.startswith('data: '):
             continue
         d = line[6:]
-        if d.strip() == "[DONE]":
+        if d.strip() == '[DONE]':
             break
         try:
             chunk = json.loads(d)
-            model = chunk.get("model", model)
-            u = chunk.get("usage")
+            model = chunk.get('model', model)
+            u = chunk.get('usage')
             if u:
-                pt = u.get("prompt_tokens", pt)
-                ct = u.get("completion_tokens", ct)
-            for c in chunk.get("choices", []):
-                delta = c.get("delta", {})
-                if delta.get("content"):
-                    content += delta["content"]
-                if delta.get("reasoning_content"):
-                    reasoning += delta["reasoning_content"]
-                if c.get("finish_reason"):
-                    finish = c["finish_reason"]
-                for tc in delta.get("tool_calls", []):
-                    idx = tc.get("index", 0)
+                pt = u.get('prompt_tokens', pt)
+                ct = u.get('completion_tokens', ct)
+            for c in chunk.get('choices', []):
+                delta = c.get('delta', {})
+                if delta.get('content'):
+                    content += delta['content']
+                if delta.get('reasoning_content'):
+                    reasoning += delta['reasoning_content']
+                if c.get('finish_reason'):
+                    finish = c['finish_reason']
+                for tc in delta.get('tool_calls', []):
+                    idx = tc.get('index', 0)
                     while len(tool_calls) <= idx:
-                        tool_calls.append({
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        })
-                    if tc.get("id"):
-                        tool_calls[idx]["id"] = tc["id"]
-                    f = tc.get("function", {})
-                    if f.get("name"):
-                        tool_calls[idx]["function"]["name"] = f["name"]
-                    if f.get("arguments"):
-                        tool_calls[idx]["function"]["arguments"] += f["arguments"]
-        except Exception:
+                        tool_calls.append({'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}})
+                    if tc.get('id'):
+                        tool_calls[idx]['id'] = tc['id']
+                    f = tc.get('function', {})
+                    if f.get('name'):
+                        tool_calls[idx]['function']['name'] = f['name']
+                    if f.get('arguments'):
+                        tool_calls[idx]['function']['arguments'] += f['arguments']
+        except:
             pass
 
     msg = {"role": "assistant", "content": content or None}
@@ -220,26 +230,13 @@ def sse_to_nonstream(sse_text):
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-        "usage": {
-            "prompt_tokens": pt,
-            "completion_tokens": ct,
-            "total_tokens": pt + ct,
-        },
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
     }
 
-
-# ======================== Admin API 实现 ========================
-
-
-def mask_key(k):
-    """脱敏显示 Key"""
-    if not k or len(k) <= 8:
-        return k
-    return k[:8] + "..." + k[-4:]
-
+# ======================== Admin API ========================
 
 def get_accounts_response():
-    """GET /admin/accounts - 获取所有账号及统计"""
+    """GET /admin/accounts"""
     with config_lock:
         accs = copy.deepcopy(config["accounts"])
     with stats_lock:
@@ -247,7 +244,7 @@ def get_accounts_response():
     result = []
     for acc in accs:
         ak = acc["api_key"]
-        result.append({
+        info = {
             "name": acc["name"],
             "api_key": ak,
             "api_key_masked": mask_key(ak),
@@ -256,9 +253,9 @@ def get_accounts_response():
             "models": acc.get("models", []),
             "default_model": acc.get("default_model", ""),
             "stats": s.get(ak, {}),
-        })
+        }
+        result.append(info)
     return 200, {"accounts": result, "known_models": KNOWN_MODELS}
-
 
 def put_account(body):
     """PUT /admin/accounts - 更新账号"""
@@ -279,7 +276,6 @@ def put_account(body):
                 save_config(config)
                 return 200, {"success": True, "name": acc["name"]}
         return 404, {"error": "account not found"}
-
 
 def post_account(body):
     """POST /admin/accounts - 添加账号"""
@@ -303,9 +299,8 @@ def post_account(body):
         save_config(config)
     return 201, {"success": True, "name": name}
 
-
 def delete_account(body):
-    """DELETE /admin/accounts - 删除账号"""
+    """DELETE /admin/accounts"""
     api_key = body.get("api_key", "")
     with config_lock:
         for i, acc in enumerate(config["accounts"]):
@@ -316,17 +311,9 @@ def delete_account(body):
                 return 200, {"success": True, "name": name}
         return 404, {"error": "account not found"}
 
-
 def workbuddy_config(api_key=None, sync_all=False, selected_models=None):
-    """
-    GET /admin/workbuddy-config - 生成 WB 配置并写入 models.json
-
-    参数:
-      api_key: 只同步指定账号
-      all=1: 同步全部已启用账号
-      models: 逗号分隔模型列表，只同步这些模型
-
-    支持增量同步：不会删除其他账号的代理模型或非代理模型。
+    """GET /admin/workbuddy-config - 生成 WB 配置并写入 models.json
+    selected_models: 逗号分隔的 model ID 列表，只同步这些模型
     """
     with config_lock:
         all_accs = copy.deepcopy(config["accounts"])
@@ -340,7 +327,7 @@ def workbuddy_config(api_key=None, sync_all=False, selected_models=None):
     else:
         return 400, {"error": "api_key or all=1 required"}
 
-    # 读取现有配置
+    # 读取现有 models.json
     existing = []
     for mf in [WB_MODELS_FILE, CB_MODELS_FILE]:
         if os.path.exists(mf):
@@ -348,20 +335,22 @@ def workbuddy_config(api_key=None, sync_all=False, selected_models=None):
                 with open(mf, "r", encoding="utf-8") as f:
                     existing = json.load(f)
                 break
-            except Exception:
+            except:
                 pass
 
+    # 构建新模型列表
     new_models = []
     seen = set()
     model_filter = None
     if selected_models:
         model_filter = set(m.strip() for m in selected_models.split(",") if m.strip())
 
+    # 收集本次要同步的账号名
     syncing_account_names = {acc["name"] for acc in target_accs}
 
-    # 构建目标账号的模型配置
     for acc in target_accs:
         for model_id in acc.get("models", []):
+            # 如果指定了模型过滤，只处理选中的模型
             if model_filter and model_id not in model_filter:
                 continue
             wb_id = f"{acc['name']}/{model_id}"
@@ -382,47 +371,45 @@ def workbuddy_config(api_key=None, sync_all=False, selected_models=None):
                 "useCustomProtocol": False,
             })
 
-    # 保留已有的非代理模型 和 未被覆盖的其他账号的代理模型
+    # 保留已有的非代理模型 + 未被覆盖的其他账号的代理模型
     for m in existing:
         if m["id"] in seen:
             continue
+        # 非代理模型始终保留
         if m.get("vendor") != "CodeBuddy-Proxy":
             seen.add(m["id"])
             new_models.append(m)
             continue
+        # 代理模型：如果属于未被本次同步覆盖的账号，保留
         m_account = m["id"].split("/")[0] if "/" in m["id"] else ""
         if m_account and m_account not in syncing_account_names:
             seen.add(m["id"])
             new_models.append(m)
 
-    # 写入 WorkBuddy 和 CodeBuddy 的 models.json
+    # 写入文件
+    dirs = set(os.path.dirname(f) for f in [WB_MODELS_FILE, CB_MODELS_FILE])
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+
+    json_str = json.dumps(new_models, indent=2, ensure_ascii=False) + "\n"
     for mf in [WB_MODELS_FILE, CB_MODELS_FILE]:
         try:
             d = os.path.dirname(mf)
             os.makedirs(d, exist_ok=True)
+            # 备份
             if os.path.exists(mf):
                 bak = mf + ".bak"
                 shutil.copy2(mf, bak)
             with open(mf, "w", encoding="utf-8") as f:
-                json.dump(new_models, f, indent=2, ensure_ascii=False)
-                f.write("\n")
+                f.write(json_str)
         except Exception as e:
-            print(f"[sync] 写入 {mf} 失败: {e}")
+            log(f"[sync] 写入 {mf} 失败: {e}")
 
-    synced_count = sum(
-        1
-        for m in new_models
-        if m.get("vendor") == "CodeBuddy-Proxy"
-        and m["id"].split("/")[0] in syncing_account_names
-    )
+    # 本次实际新增/更新的模型数（只算目标账号的）
+    synced_count = sum(1 for m in new_models if m.get("vendor") == "CodeBuddy-Proxy" and m["id"].split("/")[0] in syncing_account_names)
     total_proxy = sum(1 for m in new_models if m.get("vendor") == "CodeBuddy-Proxy")
-    synced_names = [
-        m["id"]
-        for m in new_models
-        if m.get("vendor") == "CodeBuddy-Proxy"
-        and m["id"].split("/")[0] in syncing_account_names
-    ]
-    print(f"[sync] 本次同步 {synced_count} 个模型，当前共 {total_proxy} 个代理模型")
+    synced_names = [m["id"] for m in new_models if m.get("vendor") == "CodeBuddy-Proxy" and m["id"].split("/")[0] in syncing_account_names]
+    log(f"[sync] 本次同步 {synced_count} 个模型，当前共 {total_proxy} 个代理模型")
     return 200, {
         "success": True,
         "synced_count": synced_count,
@@ -432,34 +419,72 @@ def workbuddy_config(api_key=None, sync_all=False, selected_models=None):
         "files_written": [WB_MODELS_FILE, CB_MODELS_FILE],
     }
 
+def mask_key(k):
+    if not k or len(k) <= 8:
+        return k
+    return k[:8] + "..." + k[-4:]
+
+def _extract_tokens_from_sse(raw_bytes):
+    """从 SSE 原始数据中提取 token 用量"""
+    pt, ct = 0, 0
+    text = raw_bytes.decode("utf-8", errors="replace")
+    for line in text.split('\n'):
+        if not line.startswith('data: '):
+            continue
+        d = line[6:].strip()
+        if not d or d == '[DONE]':
+            continue
+        try:
+            chunk = json.loads(d)
+            u = chunk.get('usage')
+            if u:
+                pt = u.get('prompt_tokens', pt)
+                ct = u.get('completion_tokens', ct)
+        except:
+            pass
+    return pt, ct
 
 # ======================== HTTP Server ========================
 
-
 class ProxyHandler(BaseHTTPRequestHandler):
-    """HTTP 请求处理器：代理 /v1/chat/completions + 管理后台 API"""
-
     server_version = "LocalCodeBuddyProxy/2.0"
 
     def log_message(self, format, *args):
         if "/health" not in args[0]:
-            print(f"[{time.strftime('%H:%M:%S')}] {self.client_address[0]} {args[0]}")
+            log(f"{self.client_address[0]} {args[0]}")
 
     def _send_json(self, code, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError, IncompleteRead):
+            pass
 
     def _send_html(self, code, html):
         data = html.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError, IncompleteRead):
+            pass
+
+    def _send_sse(self, sse_text):
+        data = sse_text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
@@ -476,53 +501,72 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # ---- Admin Routes ----
 
     def _handle_admin(self, path, method):
+        try:
+            return self._handle_admin_impl(path, method)
+        except Exception as e:
+            log(f"[admin] 处理异常: {e}\n{traceback.format_exc()}")
+            try:
+                self._send_error(500, f"internal error: {e}")
+            except:
+                pass
+
+    def _handle_admin_impl(self, path, method):
         parsed = urlparse(path)
         qs = parse_qs(parsed.query)
 
-        # 管理后台页面
         if path == "/admin/dashboard" or path == "/admin" or path == "/admin/":
             try:
                 with open(ADMIN_HTML_FILE, "r", encoding="utf-8") as f:
                     html = f.read()
-            except Exception:
+            except:
                 html = "<h1>Admin Dashboard</h1><p>admin_dashboard.html 未找到</p>"
             self._send_html(200, html)
             return
 
-        # 账号管理 API
         if path == "/admin/accounts" or path.startswith("/admin/accounts?"):
             if method == "GET":
                 code, data = get_accounts_response()
                 self._send_json(code, data)
                 return
-            elif method in ("PUT", "POST", "DELETE"):
+            elif method == "PUT":
                 try:
                     length = int(self.headers.get("Content-Length", 0))
                     body = json.loads(self.rfile.read(length))
-                except Exception:
+                except:
                     self._send_error(400, "invalid JSON")
                     return
-                if method == "PUT":
-                    code, data = put_account(body)
-                elif method == "POST":
-                    code, data = post_account(body)
-                else:
-                    code, data = delete_account(body)
+                code, data = put_account(body)
+                self._send_json(code, data)
+                return
+            elif method == "POST":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length))
+                except:
+                    self._send_error(400, "invalid JSON")
+                    return
+                code, data = post_account(body)
+                self._send_json(code, data)
+                return
+            elif method == "DELETE":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length))
+                except:
+                    self._send_error(400, "invalid JSON")
+                    return
+                code, data = delete_account(body)
                 self._send_json(code, data)
                 return
 
-        # 同步到 WorkBuddy 配置
         if path.startswith("/admin/workbuddy-config"):
             api_key = qs.get("api_key", [None])[0]
             sync_all = qs.get("all", ["0"])[0] == "1"
             models = qs.get("models", [None])[0]
-            code, data = workbuddy_config(
-                api_key=api_key, sync_all=sync_all, selected_models=models
-            )
+            code, data = workbuddy_config(api_key=api_key, sync_all=sync_all, selected_models=models)
             self._send_json(code, data)
             return
 
-        # 统计接口
         if path.startswith("/admin/stats"):
             with stats_lock:
                 s = copy.deepcopy(stats)
@@ -531,24 +575,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         self._send_error(404, "admin endpoint not found")
 
-    # ---- HTTP Methods ----
+    # ---- API Routes ----
 
     def do_GET(self):
+        try:
+            return self._do_GET_impl()
+        except Exception as e:
+            log(f"[GET] 未捕获异常: {e}\n{traceback.format_exc()}")
+
+    def _do_GET_impl(self):
         path = urlparse(self.path).path
         if path.startswith("/admin"):
             self._handle_admin(self.path, "GET")
             return
         if path in ("/health", "/v1/health", "/"):
             self._send_json(200, {
-                "status": "ok",
-                "backend": "copilot.tencent.com",
-                "proxy": "LocalCodeBuddyProxy/2.0",
-                "platform": "Windows",
+                "status": "ok", "backend": "copilot.tencent.com",
+                "proxy": "LocalCodeBuddyProxy/2.0", "platform": "Windows"
             })
             return
         self._send_error(404, "not found")
 
     def do_POST(self):
+        try:
+            self._do_POST_impl()
+        except Exception as e:
+            log(f"[POST] 未捕获异常: {e}\n{traceback.format_exc()}")
+            try:
+                self._send_error(500, f"internal error: {e}")
+            except:
+                pass
+
+    def _do_POST_impl(self):
         path = urlparse(self.path).path
         if path.startswith("/admin"):
             self._handle_admin(self.path, "POST")
@@ -559,6 +617,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._handle_chat()
 
     def do_PUT(self):
+        try:
+            return self._do_PUT_impl()
+        except Exception as e:
+            log(f"[PUT] 未捕获异常: {e}\n{traceback.format_exc()}")
+
+    def _do_PUT_impl(self):
         path = urlparse(self.path).path
         if path.startswith("/admin"):
             self._handle_admin(self.path, "PUT")
@@ -566,6 +630,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_error(404, "not found")
 
     def do_DELETE(self):
+        try:
+            return self._do_DELETE_impl()
+        except Exception as e:
+            log(f"[DELETE] 未捕获异常: {e}\n{traceback.format_exc()}")
+
+    def _do_DELETE_impl(self):
         path = urlparse(self.path).path
         if path.startswith("/admin"):
             self._handle_admin(self.path, "DELETE")
@@ -584,7 +654,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error(400, f"invalid request: {e}")
             return
 
-        # 根据 apiKey 查找对应的 CK Key
+        # 根据 apiKey 找账号
         auth = self.headers.get("Authorization", "")
         token = auth.replace("Bearer ", "") if auth.lower().startswith("bearer ") else ""
         acc = None
@@ -598,89 +668,187 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error(401, "invalid or disabled API key")
             return
 
+        # 读取 stream 参数
         stream = body.get("stream", False)
         model = body.get("model", "")
 
-        # 剥离账号名前缀 (用户名/deepseek-v4-pro -> deepseek-v4-pro)
+        # 剥离账号名前缀 (妮/deepseek-v4-pro -> deepseek-v4-pro)
         real_model = model.split("/")[-1] if "/" in model else model
+
+        # 替换 body 中的 model
         body["model"] = real_model
-        # CN API 仅支持流式，始终发 stream=true
+        # CN API 只支持流式: 始终发 stream=true, 非流式请求由本代理聚合
         body["stream"] = True
         body_bytes = json.dumps(body).encode("utf-8")
 
-        print(f"[llm] account={acc['name']} model={real_model} stream_client={stream}")
+        log(f"[llm] account={acc['name']} model={real_model} stream_client={stream}")
 
         try:
-            resp = do_llm_call(acc["ck_key"], body_bytes)
+            _, result = do_llm_call(acc["ck_key"], body_bytes, True)
         except Exception as e:
             record_stats(acc["api_key"], 0, 0, False, str(e))
             self._send_error(502, f"upstream error: {e}")
             return
 
-        # 读取全部 SSE 响应
-        raw = b""
         try:
-            while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                raw += chunk
+            if stream:
+                # 流式 → 实时中继 SSE + 追踪 token 用量
+                raw_chunks = []
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    while True:
+                        chunk = result.read(8192)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        raw_chunks.append(chunk)
+                except IncompleteRead:
+                    # 上游中途断开，补发 [DONE] 让客户端正常结束 SSE
+                    try:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except:
+                        pass
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+                # 从累积的 SSE 数据中提取 token 统计
+                pt, ct = _extract_tokens_from_sse(b"".join(raw_chunks))
+                if pt > 0 or ct > 0:
+                    record_stats(acc["api_key"], pt, ct, True)
+                else:
+                    record_stats(acc["api_key"], 0, 0, True)
+            else:
+                # 非流式 → 缓存并聚合
+                raw = b""
+                try:
+                    while True:
+                        chunk = result.read(8192)
+                        if not chunk:
+                            break
+                        raw += chunk
+                except Exception as e:
+                    log(f"[llm] stream read error: {e}")
+                sse_text = raw.decode("utf-8", errors="replace")
+                aggregated = sse_to_nonstream(sse_text)
+                est_tokens = len(sse_text) // 4
+                record_stats(acc["api_key"], 0, est_tokens, True)
+                resp_data = json.dumps(aggregated, ensure_ascii=False).encode("utf-8")
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp_data)))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(resp_data)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError, IncompleteRead):
+                    pass
         except Exception as e:
-            print(f"[llm] stream read error: {e}")
-
-        sse_text = raw.decode("utf-8", errors="replace")
-        est_tokens = len(sse_text) // 4
-
-        if stream:
-            record_stats(acc["api_key"], 0, est_tokens, True)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-        else:
-            aggregated = sse_to_nonstream(sse_text)
-            record_stats(acc["api_key"], 0, est_tokens, True)
-            resp_data = json.dumps(aggregated, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(resp_data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(resp_data)
-
-
-# ======================== 入口 ========================
+            log(f"[llm] 响应异常: {e}\n{traceback.format_exc()}")
+            record_stats(acc["api_key"], 0, 0, False, str(e))
+            try:
+                self._send_error(502, f"response error: {e}")
+            except:
+                pass
 
 
 def main():
-    server = HTTPServer((HOST, PORT), ProxyHandler)
-    print(f"{'=' * 60}")
-    print(f"  LocalCodeBuddyProxy v2.0")
-    print(f"  监听: http://{HOST}:{PORT}")
-    print(f"  管理后台: http://{HOST}:{PORT}/admin/dashboard")
-    print(f"  API端点: http://{HOST}:{PORT}/v1/chat/completions")
-    print(f"  上游: {CN_API}")
-    print(f"  平台: Windows (Agent Loop 本地执行)")
-    print(f"{'=' * 60}")
+    _cleanup_port()
+    while True:
+        try:
+            _run_server()
+            # _run_server 正常返回 = 自检触发重启
+        except KeyboardInterrupt:
+            log("[shutdown] 用户中断，退出")
+            break
+        except Exception as e:
+            log(f"[FATAL] {traceback.format_exc()}")
+        log("[restart] 3秒后重启...")
+        _cleanup_port()
+        time.sleep(3)
+
+
+def _cleanup_port():
+    """强制释放端口，处理休眠唤醒后 socket 残留"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.close()
+    except:
+        pass
+
+
+def _run_server():
+    ThreadingHTTPServer.allow_reuse_address = True
+    server = ThreadingHTTPServer((HOST, PORT), ProxyHandler)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    log("=" * 60)
+    log("  LocalCodeBuddyProxy v2.1")
+    log(f"  监听: http://{HOST}:{PORT}")
+    log(f"  管理后台: http://{HOST}:{PORT}/admin/dashboard")
+    log(f"  API端点: http://{HOST}:{PORT}/v1/chat/completions")
+    log(f"  上游: {CN_API}")
+    log(f"  平台: Windows (自检自愈)")
+    log("=" * 60)
 
     if os.path.exists(ADMIN_HTML_FILE):
-        print(f"[init] 管理后台 HTML 已加载")
+        log(f"[init] 管理后台 HTML 已加载")
     else:
-        print(f"[init] 警告: 管理后台 HTML 未找到 ({ADMIN_HTML_FILE})")
+        log(f"[init] 警告: 管理后台 HTML 未找到 ({ADMIN_HTML_FILE})")
 
     with config_lock:
         n = len(config["accounts"])
-    print(f"[init] 已加载 {n} 个账号")
+    log(f"[init] 已加载 {n} 个账号")
 
+    # 手动 accept 循环 + 自检 + 休眠唤醒检测
+    server.socket.settimeout(1.0)
+    last_alive = time.time()
+    last_clock = time.time()
     try:
-        server.serve_forever()
+        while True:
+            try:
+                server.handle_request()
+                last_alive = time.time()
+                last_clock = last_alive
+            except socket.timeout:
+                now = time.time()
+                # 检测休眠唤醒：系统时钟跳变大 (>30秒)
+                if now - last_clock > 30:
+                    log(f"[detect] 系统从休眠恢复 (时钟跳变 {now - last_clock:.0f}s)，重启网络...")
+                    break
+                last_clock = now
+                # 每 5 秒无请求时自检端口
+                if now - last_alive > 5:
+                    try:
+                        s = socket.create_connection((HOST, PORT), timeout=2)
+                        s.close()
+                        last_alive = now
+                    except:
+                        log("[selfcheck] 端口无响应，触发重启")
+                        break
+                continue
+            except Exception as e:
+                log(f"[accept] 异常: {traceback.format_exc()}")
+                break
     except KeyboardInterrupt:
-        print("\n[shutdown] 正在关闭...")
-        server.shutdown()
+        log("[shutdown] 用户中断")
+        with stats_lock:
+            save_stats_file(stats)
+        raise
+    finally:
+        with stats_lock:
+            save_stats_file(stats)
+        try:
+            server.server_close()
+        except:
+            pass
 
 
 if __name__ == "__main__":
